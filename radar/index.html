@@ -1,0 +1,203 @@
+<!DOCTYPE html>
+<html>
+<head>
+<title>AstroCast Radar</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+<style>
+body{margin:0;font-family:Arial;color:white;overflow:hidden;}
+#map{height:70vh;}
+#menuButton{position:absolute;top:20px;left:20px;font-size:30px;cursor:pointer;z-index:1000;}
+#menu{position:absolute;top:0;left:-260px;width:260px;height:100%;background:#111c;padding:20px;transition:0.3s;z-index:999;overflow:auto;}
+#menu input,#menu select{width:90%;padding:6px;margin-top:8px;}
+#menu button{margin-top:8px;padding:6px;width:100%;cursor:pointer;}
+#alertsPanel{height:30vh;overflow:auto;background:#000c;padding:10px;}
+#radarControls{position:absolute;bottom:30vh;left:50%;transform:translateX(-50%);background:#000c;padding:10px;border-radius:8px;z-index:1000;}
+#radarSlider{width:260px;}
+#title{position:absolute;top:20px;left:70px;font-size:26px;z-index:1000;}
+</style>
+</head>
+<body>
+<div id="menuButton">☰</div>
+<div id="title">🌌 AstroCast</div>
+
+<div id="menu">
+<h2>Location</h2>
+<input id="city" placeholder="City">
+<input id="state" placeholder="State">
+<button onclick="searchCity()">Search</button>
+<button onclick="useGPS()">Use My Location</button>
+<hr>
+<button onclick="toggleTest()">Test Alert</button>
+<div id="testPanel" style="display:none">
+<h3>Send Test Alert</h3>
+<select id="testEvent">
+<option>Tornado Warning</option>
+<option>Severe Thunderstorm Warning</option>
+<option>Severe Thunderstorm Watch</option>
+<option>Flash Flood Warning</option>
+<option>Flood Advisory</option>
+<option>Winter Storm Warning</option>
+<option>Dense Fog Advisory</option>
+<option>Heat Advisory</option>
+<option>High Wind Warning</option>
+<option>Special Weather Statement</option>
+</select>
+<input id="testCity" placeholder="City">
+<input id="testState" placeholder="State">
+<button onclick="sendTestAlert()">Send</button>
+</div>
+</div>
+
+<div id="map"></div>
+
+<div id="radarControls">
+<button onclick="toggleRadar()">Play/Pause</button>
+<input type="range" id="radarSlider" min="0" max="0" value="0">
+</div>
+
+<div id="alertsPanel">
+<h2>Current Alerts</h2>
+<ul id="alertList"></ul>
+</div>
+
+<audio id="alertSound"><source src="https://actions.google.com/sounds/v1/alarms/beep_short.ogg"></audio>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+/* MAP */
+const map = L.map('map').setView([20,0],2)
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:18}).addTo(map)
+const alertLayer = L.layerGroup().addTo(map)
+
+/* MENU */
+const menu=document.getElementById("menu")
+document.getElementById("menuButton").onclick=()=>{menu.style.left=menu.style.left==="0px"?"-260px":"0px"}
+
+/* LOCATION SEARCH */
+async function searchCity(){
+const city=document.getElementById("city").value
+const state=document.getElementById("state").value
+const res=await fetch(`https://nominatim.openstreetmap.org/search?format=json&q=${city},${state}`)
+const data=await res.json()
+if(data.length){
+const lat=data[0].lat, lon=data[0].lon
+map.setView([lat,lon],8)
+fetchAlerts(lat,lon)
+}
+}
+function useGPS(){
+navigator.geolocation.getCurrentPosition(pos=>{
+const lat=pos.coords.latitude, lon=pos.coords.longitude
+map.setView([lat,lon],8)
+fetchAlerts(lat,lon)
+})
+}
+
+/* RADAR */
+let radarFrames=[], radarLayer, radarIndex=0, radarPlaying=true
+async function loadRadar(){
+try{
+const res = await fetch("https://api.rainviewer.com/public/weather-maps.json")
+const data = await res.json()
+radarFrames = data.radar.past.concat(data.radar.nowcast)
+if(radarFrames.length===0)return
+document.getElementById("radarSlider").max=radarFrames.length-1
+showRadarFrame(0)
+setInterval(()=>{
+if(!radarPlaying) return
+radarIndex++
+if(radarIndex>=radarFrames.length) radarIndex=0
+showRadarFrame(radarIndex)
+},500)
+}catch(e){console.warn("Radar fetch failed",e)}
+}
+function showRadarFrame(i){
+radarIndex=i
+const frame=radarFrames[i]
+if(!frame)return
+if(radarLayer) map.removeLayer(radarLayer)
+radarLayer=L.tileLayer(`https://tilecache.rainviewer.com/v2/radar/${frame.path}/256/{z}/{x}/{y}/2/1_1.png`,{opacity:0.5})
+radarLayer.addTo(map)
+document.getElementById("radarSlider").value=i
+}
+function toggleRadar(){radarPlaying=!radarPlaying}
+document.getElementById("radarSlider").oninput=e=>showRadarFrame(e.target.value)
+loadRadar()
+
+/* ALERT COLOR */
+function getAlertColor(event){
+event=event.toLowerCase()
+if(event.includes("tornado"))return "red"
+if(event.includes("severe"))return "orange"
+if(event.includes("flood"))return "green"
+if(event.includes("winter"))return "cyan"
+if(event.includes("fog"))return "gray"
+return "yellow"
+}
+
+/* ALERTS */
+let seenAlerts=new Set()
+async function fetchAlerts(lat,lon){
+try{
+const res = await fetch(`https://api.weather.gov/alerts/active?point=${lat},${lon}`)
+if(!res.ok) return
+const data = await res.json()
+if(!data.features) return
+alertLayer.clearLayers()
+data.features.forEach(alert=>{
+const id = alert.id || alert.properties.id
+if(seenAlerts.has(id)) return
+seenAlerts.add(id)
+const props=alert.properties, event=props.event, area=props.areaDesc
+addAlert(event,area)
+if(alert.geometry){
+const geo=L.geoJSON(alert.geometry,{style:{color:getAlertColor(event),fillOpacity:0.25,weight:2}})
+geo.bindPopup(`<b>${event}</b><br>${area}`)
+geo.addTo(alertLayer)
+}
+})
+}catch(e){console.warn("Fetching alerts failed",e)}
+}
+
+/* ALERT LIST + TTS */
+function addAlert(event,area){
+const list=document.getElementById("alertList")
+const li=document.createElement("li")
+li.textContent=`${event} — ${area}`
+list.appendChild(li)
+document.getElementById("alertSound").play()
+const speech=new SpeechSynthesisUtterance(`A ${event} has been issued for ${area}. See on radar.`)
+speechSynthesis.speak(speech)
+}
+
+/* TEST PANEL */
+function toggleTest(){
+const panel=document.getElementById("testPanel")
+panel.style.display = panel.style.display==="none"?"block":"none"
+}
+async function sendTestAlert(){
+const event=document.getElementById("testEvent").value
+const city=document.getElementById("testCity").value
+const state=document.getElementById("testState").value
+const area=`${city}, ${state}`
+addAlert(event,area)
+try{
+const res=await fetch(`https://nominatim.openstreetmap.org/search?format=json&q=${city},${state}`)
+const data=await res.json()
+if(data.length){
+const lat=data[0].lat, lon=data[0].lon
+map.setView([lat,lon],9)
+const circle=L.circle([lat,lon],{radius:30000,color:getAlertColor(event),fillOpacity:0.2})
+circle.addTo(alertLayer)
+circle.bindPopup(`<b>${event}</b><br>${area}`)
+}
+}catch(e){console.warn("Test alert geocode failed",e)}
+}
+
+/* Default location poll */
+let currentLocation={lat:43.0481, lon:-76.1474} // Syracuse, NY default
+fetchAlerts(currentLocation.lat,currentLocation.lon)
+setInterval(()=>fetchAlerts(currentLocation.lat,currentLocation.lon),60000)
+</script>
+</body>
+</html>
